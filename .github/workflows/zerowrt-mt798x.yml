@@ -1,0 +1,257 @@
+#=====================================================================================
+# Build ZeroWrt for ALL MT798x devices (mediatek/filogic target)
+# 源码：tvliving/zerowrt（OpenWrt 25.12 分支，ZeroWrt 定制：默认 IP 10.0.0.1、国内 NTP）
+# 单 job 顺序编译：MT7981 → MT7986 → MT7988(含 MT7987)，固件保留到 out/ 最后统一上传
+# 设备清单在运行时自动从 target/linux/mediatek/image/filogic.mk 解析：
+#   DEVICE_DTS 以 mt7981* → MT7981 组；mt7986* → MT7986 组；mt7987*/mt7988* → MT7988 组
+#   （无 DEVICE_DTS 的公共父定义自动跳过；上游新增/删改机型无需改本脚本）
+# 每周二早上 8:00（北京时间）自动编译；手动触发可选平台
+# Release 标签 Zerowrt-MT7981-YYYY-MM-DD 等，只创建不删除，保留历史
+#=====================================================================================
+
+name: Build ZeroWrt MT798x
+
+on:
+  schedule:
+    - cron: '0 0 * * 2'   # UTC 周二 00:00 = 北京时间每周二 08:00（GitHub 定时可能延迟几分钟）
+  workflow_dispatch:
+    inputs:
+      chips:
+        description: "选择编译平台"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - MT7981
+          - MT7986
+          - MT7988
+
+env:
+  REPO_URL: https://github.com/tvliving/zerowrt
+  REPO_BRANCH: openwrt-25.12
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: 清理 runner 磁盘空间
+        run: |
+          # 注意：不要删除 /etc/apt/sources.list.d/ —— ubuntu-24.04 的 apt 源就在这里
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          sudo -E apt-get -y purge azure-cli* ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          df -hT
+
+      - name: 初始化编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install build-essential clang cmake cpio curl device-tree-compiler ecj fastjar \
+            flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool \
+            libelf-dev libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+            libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm \
+            lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools \
+            subversion swig texinfo unzip vim wget xmlto xxd zlib1g-dev
+          git config --global user.name "GitHub Actions" && git config --global user.email "actions@github.com"
+
+      - name: 克隆 ZeroWrt 源码并更新 feeds
+        working-directory: ${{ github.workspace }}
+        run: |
+          df -hT $PWD
+          git clone --depth 1 ${REPO_URL} -b ${REPO_BRANCH} zerowrt
+          cd zerowrt
+          echo "================= 最新提交 ================="
+          git log -1 --format="commit: %H  date: %ci"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      #===============================================================================
+      # 顺序编译：MT7981 → MT7986 → MT7988(含 MT7987)
+      # 每个平台编完把成品固件拷到 out/<平台>/ 保留，再继续下一个
+      # 三个平台同属 filogic 子目标：工具链和软件包只编译一次，后两轮基本只是打包
+      #===============================================================================
+      - name: 顺序编译全部平台
+        working-directory: ${{ github.workspace }}/zerowrt
+        run: |
+          # 手动触发可选单平台，定时/手动 all 编全部
+          chips_to_build="MT7981 MT7986 MT7988"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.chips }}" != "all" ]]; then
+            chips_to_build="${{ inputs.chips }}"
+          fi
+          echo "本次编译平台：$chips_to_build"
+
+          #--------------------------------------------------------------
+          # 从 filogic.mk 运行时解析设备清单：
+          # 逐块读取 define Device/<name> ... endef，取 DEVICE_DTS 前缀归类芯片
+          #   mt7981* -> MT7981   mt7986* -> MT7986   mt7987*/mt7988* -> MT7988
+          # 没有 DEVICE_DTS 的公共父定义（如 *-common）自动跳过
+          #--------------------------------------------------------------
+          parse_devices() {
+            awk -v want="$1" '
+              function emit() {
+                chip = "other"
+                if (dts ~ /^mt7981/)      chip = "MT7981"
+                else if (dts ~ /^mt7986/) chip = "MT7986"
+                else if (dts ~ /^mt798[78]/) chip = "MT7988"
+                if (chip == want) print name
+              }
+              /^define Device\// {
+                name = $0
+                sub(/^define Device\//, "", name)
+                sub(/[ \t]+$/, "", name)
+                dts = ""; inblk = 1; next
+              }
+              inblk && /DEVICE_DTS[ \t]*:=/ { dts = $NF; gsub(/"/, "", dts) }
+              inblk && /^endef/ { if (dts != "") emit(); inblk = 0; dts = "" }
+            ' target/linux/mediatek/image/filogic.mk
+          }
+
+          # BPI-R3/R4/R4-Lite/RFB 等设备的复合镜像（sdcard.img.gz / 多套 preloader+fip）
+          # 需要多套 bl2 + u-boot 引导，这些是独立的 boot 包，必须显式选入 .config
+          # kconfig 会自动忽略源码中不存在的包名（下面 defconfig 后有校验告警兜底）
+          extra_pkgs_for() {
+            case "$1" in
+              MT7986)
+                echo "uboot-mediatek-mt7986_bananapi_bpi_r3-emmc uboot-mediatek-mt7986_bananapi_bpi_r3-sdmmc uboot-mediatek-mt7986_bananapi_bpi_r3-snand uboot-mediatek-mt7986_bananapi_bpi_r3-nor uboot-mediatek-mt7986_bananapi_bpi_r3-mini-emmc uboot-mediatek-mt7986_bananapi_bpi_r3-mini-snand uboot-mediatek-mt7986_rfb trusted-firmware-a-mt7986-sdmmc-ddr4 trusted-firmware-a-mt7986-spim-nand-ddr4 trusted-firmware-a-mt7986-emmc-ddr4 trusted-firmware-a-mt7986-nor-ddr4 trusted-firmware-a-mt7986-snand-ddr4 trusted-firmware-a-mt7986-spim-nand-ubi-ddr4"
+                ;;
+              MT7988)
+                echo "uboot-mediatek-mt7988_bananapi_bpi_r4-emmc uboot-mediatek-mt7988_bananapi_bpi_r4-sdmmc uboot-mediatek-mt7988_bananapi_bpi_r4-snand uboot-mediatek-mt7988_bananapi_bpi_r4_poe-emmc uboot-mediatek-mt7988_bananapi_bpi_r4_poe-sdmmc uboot-mediatek-mt7988_bananapi_bpi_r4_poe-snand uboot-mediatek-mt7987_bananapi_bpi_r4_lite-emmc uboot-mediatek-mt7987_bananapi_bpi_r4_lite-sdmmc uboot-mediatek-mt7987_bananapi_bpi_r4_lite-snand uboot-mediatek-mt7987_bananapi_bpi_r4_lite-nor uboot-mediatek-mt7988_rfb-emmc uboot-mediatek-mt7988_rfb-sdmmc uboot-mediatek-mt7988_rfb-snand uboot-mediatek-mt7988_rfb-nor trusted-firmware-a-mt7987-emmc-comb trusted-firmware-a-mt7987-nor-comb trusted-firmware-a-mt7987-sdmmc-comb trusted-firmware-a-mt7987-spim-nand0-ubi-comb trusted-firmware-a-mt7987-spim-nand2-ubi-comb trusted-firmware-a-mt7988-emmc-comb trusted-firmware-a-mt7988-nor-comb trusted-firmware-a-mt7988-sdmmc-comb trusted-firmware-a-mt7988-snand-comb trusted-firmware-a-mt7988-snand-ubi-comb trusted-firmware-a-mt7988-spim-nand-comb trusted-firmware-a-mt7988-spim-nand-ubi-comb"
+                ;;
+            esac
+          }
+
+          build_chip() {
+            local chip="$1"
+            local devices; devices=$(parse_devices "$chip")
+            if [[ -z "$devices" ]]; then
+              echo ">>> [$chip] ⚠️ 未从 filogic.mk 解析到设备，跳过"
+              return 1
+            fi
+            echo ""
+            echo "############################################################"
+            echo "##########  开始编译 $chip（$(echo $devices | wc -w) 台设备）  ##########"
+            echo "############################################################"
+
+            {
+              echo "CONFIG_TARGET_mediatek=y"
+              echo "CONFIG_TARGET_mediatek_filogic=y"
+              echo "CONFIG_TARGET_MULTI_PROFILE=y"
+              echo "CONFIG_TARGET_PER_DEVICE_ROOTFS=y"
+              for d in $devices; do
+                echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${d}=y"
+              done
+              for p in $(extra_pkgs_for "$chip"); do
+                echo "CONFIG_PACKAGE_${p}=y"
+              done
+              echo "CONFIG_PACKAGE_luci=y"
+              echo "CONFIG_PACKAGE_luci-compat=y"
+            } > .config
+            make defconfig
+
+            # 校验：kconfig 是否接受了全部 boot 依赖包（不接受说明源码里没有该包名）
+            for p in $(extra_pkgs_for "$chip"); do
+              grep -qx "CONFIG_PACKAGE_${p}=y" .config || \
+                echo "::warning::[$chip] 包 $p 未被 kconfig 接受（源码中不存在），相关复合镜像可能缺 boot 依赖"
+            done
+
+            echo ">>> [$chip] 已选设备："
+            grep "CONFIG_TARGET_DEVICE" .config | sed 's/CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_//;s/=y//' | tr '\n' ' '
+            echo ""
+
+            echo ">>> [$chip] 下载软件包"
+            make download -j$(nproc)
+            find dl -size -1024c -exec rm -f {} \;
+
+            echo ">>> [$chip] 开始编译"
+            if ! make -j$(nproc); then
+              echo ">>> [$chip] 并行编译失败，改用单线程重试以定位错误"
+              make -j1 V=s || { echo ">>> [$chip] ❌ 编译失败"; return 1; }
+            fi
+
+            echo ">>> [$chip] 收集固件到 out/$chip/"
+            mkdir -p "$GITHUB_WORKSPACE/out/$chip"
+            find bin/targets/mediatek/filogic -type f \( -name "*sysupgrade*" -o -name "*factory*" -o -name "*sdcard*" \) \
+              ! -name "*json*" -exec cp {} "$GITHUB_WORKSPACE/out/$chip/" \;
+            ls -lh "$GITHUB_WORKSPACE/out/$chip/"
+            local n; n=$(ls "$GITHUB_WORKSPACE/out/$chip" | wc -l)
+            if [[ "$n" -eq 0 ]]; then
+              echo ">>> [$chip] ❌ 没有产出任何固件"
+              return 1
+            fi
+            echo ">>> [$chip] ✅ 完成，共 $n 个固件"
+          }
+
+          # 单平台失败只记录、不中断：继续编译下一个平台，最后汇总
+          FAILED=""
+          for chip in $chips_to_build; do
+            if build_chip "$chip"; then
+              echo ">>> [$chip] ✅ 全部完成"
+            else
+              echo ">>> [$chip] ❌ 编译失败（详见上方日志），继续下一个平台"
+              FAILED="$FAILED $chip"
+            fi
+          done
+          if [[ -n "$FAILED" ]]; then
+            echo "::warning::以下平台编译失败:$FAILED（其余平台固件照常发布）"
+            echo "$FAILED" > "$GITHUB_WORKSPACE/failed_chips.txt"
+          fi
+
+          echo ""
+          echo "================= 全部平台编译完成，out 目录汇总 ================="
+          du -sh "$GITHUB_WORKSPACE"/out/* 2>/dev/null || true
+          df -hT
+
+      - name: 上传到 Release
+        working-directory: ${{ github.workspace }}/zerowrt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          for chip in MT7981 MT7986 MT7988; do
+            dir="$GITHUB_WORKSPACE/out/$chip"
+            [[ -d "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]] || { echo ">>> $chip 无固件，跳过上传"; continue; }
+
+            TAG="Zerowrt-${chip}-$(TZ=Asia/Shanghai date +%Y-%m-%d)"
+            echo ">>> 上传 $chip → $TAG（$(ls "$dir" | wc -l) 个文件）"
+
+            {
+              echo "### ZeroWrt for $chip"
+              echo "- 源码：[tvliving/zerowrt](${REPO_URL}/tree/${REPO_BRANCH})"
+              echo "- 分支：${REPO_BRANCH}（每周二 08:00 北京时间自动编译）"
+              echo "- 编译时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') (UTC+8)"
+              echo "- 默认 IP：10.0.0.1 / 用户名 root / 密码：无"
+              echo "### 固件列表"
+              ls "$dir"
+            } > notes_$chip.md
+
+            # 只创建、不删除：已存在则复用，历史版本全部保留
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+              gh release create "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "ZeroWrt $chip ($(TZ=Asia/Shanghai date +%Y-%m-%d))" \
+                --notes-file "notes_$chip.md"
+
+            ok=0
+            for i in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$dir"/* --repo "$GITHUB_REPOSITORY" --clobber; then
+                echo ">>> ✅ $chip 上传完成"
+                ok=1
+                break
+              fi
+              echo ">>> ⚠️ $chip 第 $i 次上传失败，10 秒后重试"
+              sleep 10
+            done
+            [[ "$ok" -eq 1 ]] || { echo ">>> ❌ $chip 上传 5 次均失败"; exit 1; }
+          done
+          echo ">>> 🎉 全部上传完成"
