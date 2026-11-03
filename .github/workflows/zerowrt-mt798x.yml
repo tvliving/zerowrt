@@ -26,6 +26,7 @@ on:
           - MT7981
           - MT7986
           - MT7988
+          - OTHER
 
 env:
   REPO_URL: https://github.com/tvliving/zerowrt
@@ -68,13 +69,109 @@ jobs:
       - name: 克隆 ZeroWrt 源码并更新 feeds
         working-directory: ${{ github.workspace }}
         run: |
-          df -hT $PWD
-          git clone --depth 1 ${REPO_URL} -b ${REPO_BRANCH} zerowrt
+          df -hT "$PWD"
+
+          #--------------------------------------------------------------
+          # 1) 克隆源码：重试 3 次，失败时给出明确原因（不再只抛一句 exit code 1）
+          #--------------------------------------------------------------
+          ok=0
+          for i in 1 2 3; do
+            rm -rf zerowrt
+            if git clone --depth 1 --single-branch -b "$REPO_BRANCH" "$REPO_URL" zerowrt; then
+              ok=1
+              break
+            fi
+            echo "::warning::克隆失败（第 $i 次），10 秒后重试"
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::克隆 $REPO_URL 的分支 $REPO_BRANCH 失败，请确认仓库地址与分支名是否正确"
+            exit 1
+          fi
           cd zerowrt
           echo "================= 最新提交 ================="
           git log -1 --format="commit: %H  date: %ci"
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+
+          #--------------------------------------------------------------
+          # 2) 校验 feeds 仓库（本次编译失败的根因就在这里）
+          #    ZeroWrt 的 feeds.conf.default 是：
+          #      packages  → github.com/zerowrt/packages   （存在）
+          #      luci      → github.com/zerowrt/luci       （存在）
+          #      routing   → github.com/zerowrt/routing    （不存在！）
+          #      telephony → github.com/zerowrt/telephony  （不存在！）
+          #      video     → github.com/zerowrt/video      （不存在！）
+          #    zerowrt 组织下只有 asu / firmware-selector / zerowrt / packages / luci
+          #    五个仓库，所以 ./scripts/feeds update -a 拉到 routing 就会
+          #    "repository not found" 并整体退出 1。
+          #    处理：逐条探测，缺的自动回退到 openwrt 官方同名 feed（同分支 openwrt-25.12），
+          #          官方也没有的才跳过并告警。
+          #--------------------------------------------------------------
+          echo "================= 校验 feeds 仓库 ================="
+          : > feeds.conf
+          SKIPPED_FEEDS=""
+          while read -r kind name url _rest; do
+            case "$kind" in
+              ''|'#'*) continue ;;
+            esac
+            [ -z "${url:-}" ] && continue
+            repo="${url%%;*}"
+            branch=""
+            case "$url" in *";"*) branch="${url#*;}" ;; esac
+
+            rc=1
+            set +e
+            if [ -z "$branch" ]; then
+              git ls-remote "$repo" HEAD </dev/null >/dev/null 2>&1
+            else
+              git ls-remote --heads "$repo" "$branch" </dev/null >/dev/null 2>&1
+            fi
+            rc=$?
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              echo "$kind $name $url" >> feeds.conf
+              echo "  ✔ $name → $repo${branch:+ ($branch)}"
+              continue
+            fi
+
+            # 回退：zerowrt/<name> → openwrt/<name>
+            alt=""
+            case "$repo" in
+              https://github.com/zerowrt/*) alt="https://github.com/openwrt/${repo##*/}" ;;
+            esac
+            if [ -n "$alt" ]; then
+              set +e
+              if [ -z "$branch" ]; then
+                git ls-remote "$alt" HEAD </dev/null >/dev/null 2>&1
+              else
+                git ls-remote --heads "$alt" "$branch" </dev/null >/dev/null 2>&1
+              fi
+              rc=$?
+              set -e
+              if [ "$rc" -eq 0 ]; then
+                echo "::warning::feed $name 的仓库 $repo 不存在，已回退到官方 $alt"
+                echo "$kind $name ${alt}${branch:+;$branch}" >> feeds.conf
+                echo "  ⚠ $name → $alt${branch:+ ($branch)}（官方源替代）"
+                continue
+              fi
+            fi
+
+            echo "::warning::feed $name 的仓库 $repo 不可用且无官方替代，已跳过（不影响 filogic 主固件，仅缺该源内插件）"
+            SKIPPED_FEEDS="$SKIPPED_FEEDS $name"
+          done < feeds.conf.default
+
+          echo "================= 最终 feeds.conf ================="
+          cat feeds.conf
+          echo "跳过/缺失的 feed：${SKIPPED_FEEDS:- 无}"
+
+          if ! ./scripts/feeds update -a; then
+            echo "::error::feeds update 失败，请看上方 git 报错（多为 feed 仓库地址失效或网络问题）"
+            exit 1
+          fi
+          if ! ./scripts/feeds install -a; then
+            echo "::error::feeds install 失败，请看上方报错"
+            exit 1
+          fi
 
       #===============================================================================
       # 顺序编译：MT7981 → MT7986 → MT7988(含 MT7987)
@@ -84,38 +181,107 @@ jobs:
       - name: 顺序编译全部平台
         working-directory: ${{ github.workspace }}/zerowrt
         run: |
+          #--------------------------------------------------------------
+          # 从 filogic.mk 运行时解析设备清单（保证不漏编）：
+          #   1) 设备全集取 TARGET_DEVICES += 行（源码真实注册的设备，公共模板不会混进来）
+          #   2) 芯片型号来自 DEVICE_DTS；自身没写的（如 smartrg_sdg-8612 之类调用模板的）
+          #      沿 $(call Device/<模板>) 父定义链继承，最多找 8 层
+          #   3) mt7981* → MT7981，mt7986* → MT7986，mt7987*/mt7988* → MT7988，
+          #      其余（新增芯片/解析不到 DTS）进 OTHER 组单独编译 —— 宁多编不可漏编
+          #--------------------------------------------------------------
+          MK=target/linux/mediatek/image/filogic.mk
+          WORK="$RUNNER_TEMP/zerowrt-meta"
+          mkdir -p "$WORK/groups"
+
+          build_devmap() {
+            # 第一遍：逐块收集 设备名 / DEVICE_DTS / 父模板
+            awk '
+              /^define Device\// {
+                name = $0; sub(/^define Device\//, "", name); sub(/[ \t]+$/, "", name)
+                cur = name; dts = ""; par = ""; inblk = 1; next
+              }
+              inblk && /DEVICE_DTS[ \t]*:=/ {
+                v = $0; sub(/^[^=]*:=[ \t]*/, "", v); gsub(/["\t ]/, "", v)
+                if (dts == "") dts = v
+              }
+              inblk && /Device\// {
+                line = $0
+                while (match(line, /Device\/[A-Za-z0-9_.-]+/)) {
+                  p = substr(line, RSTART + 7, RLENGTH - 7)
+                  if (p != cur && par == "") par = p
+                  line = substr(line, RSTART + RLENGTH)
+                }
+              }
+              inblk && /^endef/ { print cur "\t" dts "\t" par; inblk = 0 }
+            ' "$MK" > "$WORK/raw_defs.txt"
+
+            # 第二遍：自身没有 DTS 的，沿父定义链向上找
+            awk -F'\t' '
+              { nm[NR] = $1; dts[$1] = $2; par[$1] = $3 }
+              END {
+                for (i = 1; i <= NR; i++) {
+                  x = nm[i]; dd = dts[x]; pp = par[x]; c = 0
+                  while (dd == "" && pp != "" && c < 8) { dd = dts[pp]; pp = par[pp]; c++ }
+                  print x "\t" dd
+                }
+              }
+            ' "$WORK/raw_defs.txt" > "$WORK/devmap.txt"
+
+            # 设备全集：源码里 TARGET_DEVICES += 注册的那些
+            awk '/^TARGET_DEVICES[ \t]*\+=/ { sub(/^TARGET_DEVICES[ \t]*\+=/, ""); print }' "$MK" \
+              | tr -s ' ' '\n' | sed '/^$/d' | sort -u > "$WORK/target_devices.txt"
+
+            # 兜底：万一上游改写注册方式，退化为“按 DTS 分类的全部定义”
+            if [ ! -s "$WORK/target_devices.txt" ]; then
+              echo "::warning::未解析到 TARGET_DEVICES 行，退化为按 DEVICE_DTS 分类全部设备定义"
+              awk -F'\t' '$2 != "" { print $1 }' "$WORK/devmap.txt" | sort -u > "$WORK/target_devices.txt"
+            fi
+          }
+
+          build_groups() {
+            : > "$WORK/groups/MT7981.txt"
+            : > "$WORK/groups/MT7986.txt"
+            : > "$WORK/groups/MT7988.txt"
+            : > "$WORK/groups/OTHER.txt"
+            local d dts chip
+            while read -r d; do
+              [ -z "$d" ] && continue
+              dts=$(awk -F'\t' -v n="$d" '$1 == n { print $2 }' "$WORK/devmap.txt")
+              case "$dts" in
+                mt7981*)    chip=MT7981 ;;
+                mt7986*)    chip=MT7986 ;;
+                mt798[78]*) chip=MT7988 ;;
+                *)          chip=OTHER  ;;
+              esac
+              echo "$d" >> "$WORK/groups/$chip.txt"
+            done < "$WORK/target_devices.txt"
+          }
+
+          chip_devices() { cat "$WORK/groups/$1.txt" 2>/dev/null; }
+
+          build_devmap
+          build_groups
+
+          echo "================= 源码设备清单 ================="
+          echo "源码注册设备总数：$(wc -l < "$WORK/target_devices.txt")"
+          for c in MT7981 MT7986 MT7988 OTHER; do
+            echo "  $c: $(wc -l < "$WORK/groups/$c.txt") 台"
+          done
+          if [ -s "$WORK/groups/OTHER.txt" ]; then
+            echo "::warning::以下机型未按 DTS 归入 7981/7986/7988，将单独编译：$(tr '\n' ' ' < "$WORK/groups/OTHER.txt")"
+          fi
+
           # 手动触发可选单平台，定时/手动 all 编全部
           chips_to_build="MT7981 MT7986 MT7988"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.chips }}" != "all" ]]; then
+          single=0
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.chips }}" != "all" ]; then
             chips_to_build="${{ inputs.chips }}"
+            single=1
+          fi
+          if [ "$single" -eq 0 ] && [ -s "$WORK/groups/OTHER.txt" ]; then
+            chips_to_build="$chips_to_build OTHER"
           fi
           echo "本次编译平台：$chips_to_build"
-
-          #--------------------------------------------------------------
-          # 从 filogic.mk 运行时解析设备清单：
-          # 逐块读取 define Device/<name> ... endef，取 DEVICE_DTS 前缀归类芯片
-          #   mt7981* -> MT7981   mt7986* -> MT7986   mt7987*/mt7988* -> MT7988
-          # 没有 DEVICE_DTS 的公共父定义（如 *-common）自动跳过
-          #--------------------------------------------------------------
-          parse_devices() {
-            awk -v want="$1" '
-              function emit() {
-                chip = "other"
-                if (dts ~ /^mt7981/)      chip = "MT7981"
-                else if (dts ~ /^mt7986/) chip = "MT7986"
-                else if (dts ~ /^mt798[78]/) chip = "MT7988"
-                if (chip == want) print name
-              }
-              /^define Device\// {
-                name = $0
-                sub(/^define Device\//, "", name)
-                sub(/[ \t]+$/, "", name)
-                dts = ""; inblk = 1; next
-              }
-              inblk && /DEVICE_DTS[ \t]*:=/ { dts = $NF; gsub(/"/, "", dts) }
-              inblk && /^endef/ { if (dts != "") emit(); inblk = 0; dts = "" }
-            ' target/linux/mediatek/image/filogic.mk
-          }
 
           # BPI-R3/R4/R4-Lite/RFB 等设备的复合镜像（sdcard.img.gz / 多套 preloader+fip）
           # 需要多套 bl2 + u-boot 引导，这些是独立的 boot 包，必须显式选入 .config
@@ -133,14 +299,15 @@ jobs:
 
           build_chip() {
             local chip="$1"
-            local devices; devices=$(parse_devices "$chip")
-            if [[ -z "$devices" ]]; then
-              echo ">>> [$chip] ⚠️ 未从 filogic.mk 解析到设备，跳过"
+            local devices; devices=$(chip_devices "$chip" | tr '\n' ' ')
+            if [ -z "${devices// /}" ]; then
+              echo ">>> [$chip] ⚠️ 该组没有设备，跳过"
               return 1
             fi
+            local want_n; want_n=$(echo $devices | wc -w)
             echo ""
             echo "############################################################"
-            echo "##########  开始编译 $chip（$(echo $devices | wc -w) 台设备）  ##########"
+            echo "##########  开始编译 $chip（$want_n 台设备）  ##########"
             echo "############################################################"
 
             {
@@ -165,13 +332,27 @@ jobs:
                 echo "::warning::[$chip] 包 $p 未被 kconfig 接受（源码中不存在），相关复合镜像可能缺 boot 依赖"
             done
 
+            # 校验：选中的机型有没有被 kconfig 丢掉（设备 ID 不存在时会静默丢弃）
+            set +e
+            local got_n; got_n=$(grep -c "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y" .config)
+            set -e
+            echo ">>> [$chip] defconfig 后选中 $got_n / 预期 $want_n 台"
+            if [ "$got_n" -lt "$want_n" ]; then
+              grep "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config \
+                | sed 's/.*DEVICE_//;s/=y//' | sort > "$WORK/got.txt"
+              echo $devices | tr ' ' '\n' | sed '/^$/d' | sort > "$WORK/want.txt"
+              echo "::warning::[$chip] 以下机型未被 kconfig 识别（源码中已不存在），已自动忽略："
+              comm -23 "$WORK/want.txt" "$WORK/got.txt" | sed 's/^/::warning::  /'
+            fi
+
             echo ">>> [$chip] 已选设备："
-            grep "CONFIG_TARGET_DEVICE" .config | sed 's/CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_//;s/=y//' | tr '\n' ' '
+            grep "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config \
+              | sed 's/.*DEVICE_//;s/=y//' | tr '\n' ' '
             echo ""
 
             echo ">>> [$chip] 下载软件包"
-            make download -j$(nproc)
-            find dl -size -1024c -exec rm -f {} \;
+            make download -j$(nproc) || echo "::warning::[$chip] 部分软件包下载失败，编译阶段会自动重试"
+            find dl -size -1024c -exec rm -f {} \; 2>/dev/null || true
 
             echo ">>> [$chip] 开始编译"
             if ! make -j$(nproc); then
@@ -179,13 +360,14 @@ jobs:
               make -j1 V=s || { echo ">>> [$chip] ❌ 编译失败"; return 1; }
             fi
 
+            # 每轮编完先把 bin/ 清空，避免上一轮的固件混进本轮产物
             echo ">>> [$chip] 收集固件到 out/$chip/"
             mkdir -p "$GITHUB_WORKSPACE/out/$chip"
             find bin/targets/mediatek/filogic -type f \( -name "*sysupgrade*" -o -name "*factory*" -o -name "*sdcard*" \) \
               ! -name "*json*" -exec cp {} "$GITHUB_WORKSPACE/out/$chip/" \;
-            ls -lh "$GITHUB_WORKSPACE/out/$chip/"
-            local n; n=$(ls "$GITHUB_WORKSPACE/out/$chip" | wc -l)
-            if [[ "$n" -eq 0 ]]; then
+            ls -lh "$GITHUB_WORKSPACE/out/$chip/" || true
+            local n; n=$(ls "$GITHUB_WORKSPACE/out/$chip" 2>/dev/null | wc -l)
+            if [ "$n" -eq 0 ]; then
               echo ">>> [$chip] ❌ 没有产出任何固件"
               return 1
             fi
@@ -218,9 +400,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          for chip in MT7981 MT7986 MT7988; do
-            dir="$GITHUB_WORKSPACE/out/$chip"
-            [[ -d "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]] || { echo ">>> $chip 无固件，跳过上传"; continue; }
+          # 按 out/ 下实际存在的平台目录上传（含可能的 OTHER 组）
+          shopt -s nullglob
+          for dir in "$GITHUB_WORKSPACE"/out/*/; do
+            [ -d "$dir" ] || continue
+            chip=$(basename "$dir")
+            if [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+              echo ">>> $chip 无固件，跳过上传"
+              continue
+            fi
 
             TAG="Zerowrt-${chip}-$(TZ=Asia/Shanghai date +%Y-%m-%d)"
             echo ">>> 上传 $chip → $TAG（$(ls "$dir" | wc -l) 个文件）"
