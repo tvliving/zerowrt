@@ -85,7 +85,7 @@ jobs:
         if: steps.pick.outputs.selected != 'false'
         run: |
           cd .
-          bash ../scripts/customize.sh .
+          bash scripts/customize.sh .
 
       - name: 生成 .config 并校验机型
         if: steps.pick.outputs.selected != 'false'
@@ -94,10 +94,10 @@ jobs:
           {
             echo 'CONFIG_TARGET_mediatek=y'
             echo 'CONFIG_TARGET_mediatek_filogic=y'
-            cat ../devices-pack/"${{ matrix.slug }}"/config.fragment
+            cat devices-pack/"${{ matrix.slug }}"/config.fragment
           } > .config
           make defconfig
-          cat ../devices-pack/"${{ matrix.slug }}"/config.fragment >> .config
+          cat devices-pack/"${{ matrix.slug }}"/config.fragment >> .config
           echo 'CONFIG_PACKAGE_luci-theme-vantage=y' >> .config
           echo 'CONFIG_LUCI_LANG_zh_Hans=y' >> .config
           make defconfig
