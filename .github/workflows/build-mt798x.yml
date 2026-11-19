@@ -126,9 +126,16 @@ jobs:
       - name: 编译
         if: steps.pick.outputs.selected != 'false'
         run: |
-          set -o pipefail
           cd .
-          make -j"$(( $(nproc) + 1 ))" 2>&1 | tee build.log
+          set -o pipefail
+          if make -j"$(( $(nproc) + 1 ))" 2>&1 | tee build.log; then
+            echo "编译成功"
+          else
+            echo "::warning::并行编译失败，串行重跑 target/linux 以输出真实错误"
+            make target/linux/install V=s 2>&1 | tail -150 || true
+            echo "::error::target/linux 镜像阶段失败，错误见上方日志"
+            exit 1
+          fi
 
       - name: 收集产物
         if: steps.pick.outputs.selected != 'false'
