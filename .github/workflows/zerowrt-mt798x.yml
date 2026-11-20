@@ -12,8 +12,6 @@
 name: Build ZeroWrt MT798x
 
 on:
-  schedule:
-    - cron: '0 0 * * 2'   # UTC 周二 00:00 = 北京时间每周二 08:00（GitHub 定时可能延迟几分钟）
   workflow_dispatch:
     inputs:
       chips:
