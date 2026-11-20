@@ -122,9 +122,10 @@ jobs:
           # VERSION_DIST 在 package/base-files/image-config.in 的 `if VERSIONOPT` 内，
           # VERSIONOPT 是 menuconfig（默认 n，仅 IMAGEOPT=y 时可见），IMAGEOPT 同样默认 n；
           # 不一起打开时 make defconfig 会把 CONFIG_VERSION_DIST 丢掉。
-          sed -i '/^CONFIG_IMAGEOPT=/d;/^CONFIG_VERSIONOPT=/d;/^CONFIG_VERSION_DIST=/d' .config
           printf 'CONFIG_IMAGEOPT=y\nCONFIG_VERSIONOPT=y\nCONFIG_VERSION_DIST="ZeroWrt"\n' >> .config
           make defconfig
+          sed -i '/^CONFIG_VERSION_DIST=/d' .config
+          echo 'CONFIG_VERSION_DIST="ZeroWrt"' >> .config
           grep -q '^CONFIG_VERSION_DIST="ZeroWrt"$' .config || { echo "::error::VERSION_DIST 未生效（期望 zerowrt-* 产物名）"; exit 1; }
           echo "---- 机型 ----"
           grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || {
